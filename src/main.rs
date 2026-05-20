@@ -1,5 +1,5 @@
 use crate::time_range_parser::TimeRangeParser;
-use chrono::{DateTime, Local, Utc};
+use chrono::{DateTime, Local, Timelike, Utc};
 use huelib2::resource::group::StateModifier;
 use huelib2::resource::{Light, Scene};
 use huelib2::Bridge;
@@ -20,6 +20,10 @@ struct StateChange {
 
 fn main() {
     let mut light_states = HashMap::<String, StateChange>::new();
+    // Tracks the last scene applied per light-group (keyed by sorted-lights hash).
+    // Used to detect time-slot changes and avoid redundant transitions.
+    let mut active_scenes = HashMap::<u64, String>::new();
+    let mut last_minute: Option<u32> = None;
     let mut conf = config::load_config();
     let bridge = Bridge::new(conf.bridge_ip.clone(), &conf.bridge_username);
 
@@ -41,28 +45,23 @@ fn main() {
             }
         };
 
-        // Write debug file if needed
         match conf.debug_file {
             Some(ref mut file) => write_debug_file(&all_lights, file),
             None => (),
         };
 
-        // Check for light changes
         let changed_lights = all_lights
             .iter()
             .filter(|light| {
                 !utils::is_attached_light(light)
                     && light_states
                         .get(&light.id)
-                        .map(|last_reachable| last_reachable.reachable != light.state.reachable)
+                        .map(|last| last.reachable != light.state.reachable)
                         .unwrap_or(true)
             })
             .collect::<Vec<&Light>>();
 
-        if changed_lights.is_empty() {
-            continue;
-        }
-
+        // Initialize light_states on first run
         if light_states.is_empty() {
             for light in changed_lights.iter() {
                 light_states.insert(
@@ -73,21 +72,19 @@ fn main() {
                     },
                 );
             }
-
             println!("Initialized reachable lights.");
             continue;
         }
 
-        // Update reachable lights
+        // Update state for lights that changed reachability
         for light in changed_lights.iter() {
-            if let Some(last_reachable) = light_states.get(&light.id) {
-                if last_reachable.reachable && !light.state.reachable {
-                    println!("Light \"{}\" is not reachable anymore", light.name)
+            if let Some(last) = light_states.get(&light.id) {
+                if last.reachable && !light.state.reachable {
+                    println!("Light \"{}\" is not reachable anymore", light.name);
                 } else {
                     println!("Light \"{}\" is reachable again", light.name);
-                };
-            };
-
+                }
+            }
             light_states.insert(
                 light.id.clone(),
                 StateChange {
@@ -97,127 +94,187 @@ fn main() {
             );
         }
 
-        // Collect ids of all lights that are ignored / always on / not controlled by a physical switch
-        // They have the prefix "(att)" for "attached" in their name
         let ignored_light_ids = all_lights
             .iter()
             .filter(|light| utils::is_attached_light(light))
             .map(|light| &light.id)
             .collect::<Vec<&String>>();
 
-        // Check for scene changes, this is done by:
-        // 1. Extract all reachable lights that have been reachable for less than the reachability window
-        // 2. Extract all scenes that contain all the lights from 1.
         let light_trigger_ids = light_states
             .iter()
             .filter(|(_, state)| {
                 state.reachable
                     && state
                         .timestamp
-                        .map(|timestamp| timestamp.elapsed() < conf.reachability_window)
+                        .map(|t| t.elapsed() < conf.reachability_window)
                         .unwrap_or(false)
             })
-            .map(|(light_id, _)| light_id)
+            .map(|(id, _)| id)
             .collect::<Vec<&String>>();
 
-        // Extract scenes from which all lights are reachable or
-        // are attached to a scene that can be triggered
-        let Ok(changed_scenes) = bridge.get_all_scenes().map(|scenes| {
-            scenes
-                .into_iter()
-                .filter(|scene| {
-                    scene
-                        .lights
-                        .clone()
-                        .map(|light_ids| {
-                            light_ids.iter().all(|light_id| {
-                                ignored_light_ids.contains(&light_id)
-                                    || light_trigger_ids.contains(&light_id)
+        let date_time = DateTime::<Utc>::from(Local::now()).with_timezone(&conf.home_timezone);
+        let current_minute = date_time.hour() * 60 + date_time.minute();
+        let minute_changed = last_minute != Some(current_minute);
+
+        // Run scene logic when lights are triggered (Case 1) or when the minute changes (Case 2)
+        if !light_trigger_ids.is_empty() || minute_changed {
+            let Ok(all_scenes) = bridge.get_all_scenes() else {
+                eprintln!("Failed to retrieve scenes");
+                continue;
+            };
+
+            let Some((sunrise, sunset)) =
+                utils::get_sunrise_sunset(conf.home_latitude, conf.home_longitude)
+            else {
+                eprintln!("Failed to retrieve sunrise/sunset");
+                continue;
+            };
+
+            let mut parser = TimeRangeParser::new();
+            parser.define_variables(HashMap::from([
+                ("sunrise".to_string(), sunrise),
+                ("sunset".to_string(), sunset),
+            ]));
+
+            // Case 1: light was just switched on — apply the current scheduled scene immediately
+            if !light_trigger_ids.is_empty() {
+                let triggered_scenes = all_scenes
+                    .iter()
+                    .filter(|scene| {
+                        scene
+                            .lights
+                            .clone()
+                            .map(|ids| {
+                                ids.iter().all(|id| {
+                                    ignored_light_ids.contains(&id)
+                                        || light_trigger_ids.contains(&id)
+                                })
+                            })
+                            .unwrap_or(false)
+                    })
+                    .cloned()
+                    .collect::<Vec<Scene>>();
+
+                for changed_scene in triggered_scenes.iter() {
+                    if let Some(lights) = &changed_scene.lights {
+                        for light_id in lights.clone() {
+                            light_states.insert(
+                                light_id,
+                                StateChange {
+                                    timestamp: None,
+                                    reachable: true,
+                                },
+                            );
+                        }
+                    }
+                }
+
+                for scheduled in
+                    utils::get_scheduled_scenes(&conf, &parser, &triggered_scenes).iter()
+                {
+                    if let Err(err) = bridge.set_group_state(
+                        &scheduled.scene_id,
+                        &StateModifier::new()
+                            .with_scene(scheduled.scene_id.clone())
+                            .with_transition_time(10),
+                    ) {
+                        eprintln!("Failed to set scene: {}", err);
+                    }
+                    active_scenes.insert(scheduled.lights_hash, scheduled.scene_id.clone());
+                }
+            }
+
+            // Case 2: time slot changed — transition lights that are already ON
+            if minute_changed {
+                last_minute = Some(current_minute);
+
+                for scheduled in utils::get_scheduled_scenes(&conf, &parser, &all_scenes).iter() {
+                    match active_scenes.get(&scheduled.lights_hash) {
+                        None => {
+                            // First encounter for this light group — record without applying
+                            // to avoid triggering a slow transition on startup
+                            active_scenes
+                                .insert(scheduled.lights_hash, scheduled.scene_id.clone());
+                            continue;
+                        }
+                        Some(last_id) if last_id == &scheduled.scene_id => continue,
+                        Some(_) => {}
+                    }
+
+                    // Scene changed for this light group — apply only if lights are ON
+                    let lights_on = all_scenes
+                        .iter()
+                        .find(|s| s.id == scheduled.scene_id)
+                        .and_then(|s| s.lights.as_ref())
+                        .map(|lights| {
+                            lights.iter().any(|lid| {
+                                !ignored_light_ids.contains(&lid)
+                                    && light_states
+                                        .get(lid)
+                                        .map(|s| s.reachable)
+                                        .unwrap_or(false)
+                                    && all_lights
+                                        .iter()
+                                        .find(|l| &l.id == lid)
+                                        .map(|l| l.state.on.unwrap_or(false))
+                                        .unwrap_or(false)
                             })
                         })
-                        .unwrap_or(false)
-                })
-                .collect::<Vec<Scene>>()
-        }) else {
-            eprintln!("Failed to retrieve scenes");
-            continue;
-        };
+                        .unwrap_or(false);
 
-        // Reset timestamp to prevent scenes to be set multiple times
-        for changed_scene in changed_scenes.iter() {
-            if let Some(lights) = &changed_scene.lights {
-                for light_id in lights.clone() {
-                    light_states.insert(
-                        light_id,
-                        StateChange {
-                            timestamp: None,
-                            reachable: true,
-                        },
-                    );
+                    if lights_on {
+                        println!("Time slot changed, transitioning to new scene with 5-min transition");
+                        if let Err(err) = bridge.set_group_state(
+                            &scheduled.scene_id,
+                            &StateModifier::new()
+                                .with_scene(scheduled.scene_id.clone())
+                                .with_transition_time(3000),
+                        ) {
+                            eprintln!("Failed to auto-transition scene: {}", err);
+                        }
+                    }
+
+                    active_scenes.insert(scheduled.lights_hash, scheduled.scene_id.clone());
                 }
             }
         }
 
-        let Some((sunrise, sunset)) =
-            utils::get_sunrise_sunset(conf.home_latitude, conf.home_longitude)
-        else {
-            eprintln!("Failed to retrieve sunrise/sunset");
-            continue;
-        };
-
-        let mut parser = TimeRangeParser::new();
-        parser.define_variables(HashMap::from([
-            ("sunrise".to_string(), sunrise),
-            ("sunset".to_string(), sunset),
-        ]));
-
-        // Turn on currently scheduled scenes
-        for scheduled_scene in utils::get_scheduled_scenes(&conf, &parser, &changed_scenes).iter() {
-            if let Err(err) = bridge.set_group_state(
-                &scheduled_scene.scene_id,
-                &StateModifier::new().with_scene(scheduled_scene.scene_id.clone()),
-            ) {
-                eprintln!("Failed to set scene: {}", err);
+        // Turn off attached lights when all non-attached lights in a group are unreachable
+        if !changed_lights.is_empty() {
+            let Ok(all_groups) = bridge.get_all_groups() else {
+                eprintln!("Failed to retrieve groups");
                 continue;
-            }
-        }
+            };
 
-        // Turn of lights that are attached to scenes but reachable all the time
-        let Ok(all_groups) = bridge.get_all_groups() else {
-            eprintln!("Failed to retrieve groups");
-            continue;
-        };
+            for group in all_groups.iter() {
+                let some_lights_on = group.lights.iter().any(|light_id| {
+                    all_lights
+                        .iter()
+                        .find(|light| light.id == *light_id)
+                        .map(|light| light.state.on.unwrap_or(false))
+                        .unwrap_or(false)
+                });
 
-        // Turn off all groups where all lights that are not marked as attached are no longer reachable.
-        for group in all_groups.iter() {
-            let some_lights_on = group.lights.iter().any(|light_id| {
-                all_lights
-                    .iter()
-                    .find(|light| light.id == *light_id)
-                    .map(|light| light.state.on.unwrap_or(false))
-                    .unwrap_or(false)
-            });
+                let all_non_attached_turned_off = group.lights.iter().all(|light_id| {
+                    ignored_light_ids.contains(&light_id)
+                        || (light_states
+                            .get(light_id)
+                            .map(|state| !state.reachable)
+                            .unwrap_or(false))
+                });
 
-            let all_non_attached_turned_off = group.lights.iter().all(|light_id| {
-                ignored_light_ids.contains(&light_id)
-                    || (light_states
-                        .get(light_id)
-                        .map(|state| !state.reachable)
-                        .unwrap_or(false))
-            });
+                if some_lights_on && all_non_attached_turned_off {
+                    println!(
+                        "All non-attached lights are unreachable, turning off group: {}",
+                        group.name
+                    );
 
-            if some_lights_on && all_non_attached_turned_off {
-                println!(
-                    "All non-attached lights are unreachable, turning off group: {}",
-                    group.name
-                );
-
-                // Turn attached lights off
-                if let Err(err) =
-                    bridge.set_group_state(&group.id, &StateModifier::new().with_on(false))
-                {
-                    eprintln!("Failed to turn off attached lights: {}", err);
-                    continue;
+                    if let Err(err) =
+                        bridge.set_group_state(&group.id, &StateModifier::new().with_on(false))
+                    {
+                        eprintln!("Failed to turn off attached lights: {}", err);
+                        continue;
+                    }
                 }
             }
         }
@@ -240,7 +297,6 @@ fn write_debug_file(lights: &Vec<Light>, file: &mut File) {
 
     light_stats.sort_by(|a, b| a.cmp(b));
 
-    // Seek to the beginning of the file
     if let Err(err) = file.seek(std::io::SeekFrom::Start(0)) {
         eprintln!("Failed to seek to beginning of debug file: {}", err);
     }

@@ -9,6 +9,7 @@ use std::hash::{Hash, Hasher};
 #[derive(Clone, PartialEq, Debug)]
 pub struct ScheduledScene {
     pub scene_id: String,
+    pub lights_hash: u64,
     pub start: u32,
     pub end: u32,
 }
@@ -57,6 +58,7 @@ pub fn get_scheduled_scenes(
             scene_id,
             ScheduledScene {
                 scene_id: scene.id.clone(),
+                lights_hash: scene_id,
                 start: time_range.0,
                 end: time_range.1,
             },
