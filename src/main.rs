@@ -228,7 +228,9 @@ fn main() {
                             &scheduled.scene_id,
                             &StateModifier::new()
                                 .with_scene(scheduled.scene_id.clone())
-                                .with_transition_time(3000),
+                                .with_transition_time(
+                                    (conf.scene_transition.as_millis() / 100) as u16,
+                                ),
                         ) {
                             eprintln!("Failed to auto-transition scene: {}", err);
                         }

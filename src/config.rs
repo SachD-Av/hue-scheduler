@@ -11,6 +11,7 @@ pub struct Config {
     pub bridge_username: String,
     pub ping_interval: Duration,
     pub reachability_window: Duration,
+    pub scene_transition: Duration,
     pub home_timezone: Tz,
     pub home_latitude: f64,
     pub home_longitude: f64,
@@ -55,6 +56,13 @@ pub fn load_config() -> Config {
         .parse::<Tz>()
         .expect("failed to parse HOME_TIMEZONE");
 
+    let scene_transition = Duration::from_secs(
+        env::var("SCENE_TRANSITION")
+            .unwrap_or_else(|_| "300".to_string())
+            .parse::<u64>()
+            .expect("failed to parse SCENE_TRANSITION"),
+    );
+
     let debug_file = env::var("DEBUG_FILE")
         .map(|path| {
             if path.is_empty() {
@@ -70,6 +78,7 @@ pub fn load_config() -> Config {
         bridge_username,
         ping_interval,
         reachability_window,
+        scene_transition,
         home_timezone,
         home_latitude,
         home_longitude,
