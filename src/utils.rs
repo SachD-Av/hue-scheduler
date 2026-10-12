@@ -74,6 +74,9 @@ pub fn get_scheduled_scenes(
 pub fn get_sunrise_sunset(latitude: f64, longitude: f64) -> Option<(u32, u32)> {
     let (sunrise, sunset) =
         sun_times::sun_times(Local::now().date_naive(), latitude, longitude, 0f64)?;
+    // sun_times returns UTC; convert to local time before comparing with local slots
+    let sunrise = sunrise.with_timezone(&Local);
+    let sunset = sunset.with_timezone(&Local);
 
     Some((
         sunrise.hour() * 60 + sunrise.minute(),
