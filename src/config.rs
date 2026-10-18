@@ -12,6 +12,7 @@ pub struct Config {
     pub ping_interval: Duration,
     pub reachability_window: Duration,
     pub scene_transition: Duration,
+    pub scene_confirm_delay: Duration,
     pub home_timezone: Tz,
     pub home_latitude: f64,
     pub home_longitude: f64,
@@ -63,6 +64,13 @@ pub fn load_config() -> Config {
             .expect("failed to parse SCENE_TRANSITION"),
     );
 
+    let scene_confirm_delay = Duration::from_secs(
+        env::var("SCENE_CONFIRM_DELAY")
+            .unwrap_or_else(|_| "10".to_string())
+            .parse::<u64>()
+            .expect("failed to parse SCENE_CONFIRM_DELAY"),
+    );
+
     let debug_file = env::var("DEBUG_FILE")
         .map(|path| {
             if path.is_empty() {
@@ -79,6 +87,7 @@ pub fn load_config() -> Config {
         ping_interval,
         reachability_window,
         scene_transition,
+        scene_confirm_delay,
         home_timezone,
         home_latitude,
         home_longitude,

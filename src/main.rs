@@ -18,12 +18,35 @@ struct StateChange {
     pub reachable: bool,
 }
 
+struct PendingConfirm {
+    scene_id: String,
+    lights: Vec<String>,
+    due: Instant,
+}
+
+impl PendingConfirm {
+    fn new(scene_id: &str, all_scenes: &[Scene], delay: std::time::Duration) -> Self {
+        PendingConfirm {
+            scene_id: scene_id.to_string(),
+            lights: all_scenes
+                .iter()
+                .find(|s| s.id == scene_id)
+                .and_then(|s| s.lights.clone())
+                .unwrap_or_default(),
+            due: Instant::now() + delay,
+        }
+    }
+}
+
 fn main() {
     let mut light_states = HashMap::<String, StateChange>::new();
     // Tracks the last scene applied per light-group (keyed by sorted-lights hash).
     // Used to detect time-slot changes and avoid redundant transitions.
     let mut active_scenes = HashMap::<u64, String>::new();
     let mut last_minute: Option<u32> = None;
+    // Scenes to send again once their transition is over, to catch lights
+    // (typically non-Hue bulbs) that missed or aborted the first command.
+    let mut pending_confirms = Vec::<PendingConfirm>::new();
     let mut conf = config::load_config();
     let bridge = Bridge::new(conf.bridge_ip.clone(), &conf.bridge_username);
 
@@ -49,6 +72,33 @@ fn main() {
             Some(ref mut file) => write_debug_file(&all_lights, file),
             None => (),
         };
+
+        // Re-send scenes whose transition is over, if still active and lights still on
+        let (due, waiting): (Vec<PendingConfirm>, Vec<PendingConfirm>) = pending_confirms
+            .drain(..)
+            .partition(|p| p.due <= Instant::now());
+        pending_confirms = waiting;
+        for confirm in due.iter() {
+            let still_active = active_scenes.values().any(|id| id == &confirm.scene_id);
+            let lights_on = confirm.lights.iter().any(|lid| {
+                all_lights
+                    .iter()
+                    .find(|l| &l.id == lid)
+                    .map(|l| l.state.reachable && l.state.on.unwrap_or(false))
+                    .unwrap_or(false)
+            });
+            if still_active && lights_on {
+                println!("Re-applying scene to catch lights that missed the transition");
+                if let Err(err) = bridge.set_group_state(
+                    &confirm.scene_id,
+                    &StateModifier::new()
+                        .with_scene(confirm.scene_id.clone())
+                        .with_transition_time(10),
+                ) {
+                    eprintln!("Failed to re-apply scene: {}", err);
+                }
+            }
+        }
 
         let changed_lights = all_lights
             .iter()
@@ -181,6 +231,11 @@ fn main() {
                         eprintln!("Failed to set scene: {}", err);
                     }
                     active_scenes.insert(scheduled.lights_hash, scheduled.scene_id.clone());
+                    pending_confirms.push(PendingConfirm::new(
+                        &scheduled.scene_id,
+                        &all_scenes,
+                        conf.scene_confirm_delay,
+                    ));
                 }
             }
 
@@ -234,6 +289,11 @@ fn main() {
                         ) {
                             eprintln!("Failed to auto-transition scene: {}", err);
                         }
+                        pending_confirms.push(PendingConfirm::new(
+                            &scheduled.scene_id,
+                            &all_scenes,
+                            conf.scene_transition + conf.scene_confirm_delay,
+                        ));
                     }
 
                     active_scenes.insert(scheduled.lights_hash, scheduled.scene_id.clone());
