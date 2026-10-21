@@ -84,7 +84,7 @@ fn main() {
                 all_lights
                     .iter()
                     .find(|l| &l.id == lid)
-                    .map(|l| l.state.reachable && l.state.on.unwrap_or(false))
+                    .map(|l| l.state.on.unwrap_or(false))
                     .unwrap_or(false)
             });
             if still_active && lights_on {
@@ -262,12 +262,10 @@ fn main() {
                         .find(|s| s.id == scheduled.scene_id)
                         .and_then(|s| s.lights.as_ref())
                         .map(|lights| {
+                            // Reachability is ignored: non-Hue bulbs are often reported
+                            // unreachable while still accepting commands
                             lights.iter().any(|lid| {
                                 !ignored_light_ids.contains(&lid)
-                                    && light_states
-                                        .get(lid)
-                                        .map(|s| s.reachable)
-                                        .unwrap_or(false)
                                     && all_lights
                                         .iter()
                                         .find(|l| &l.id == lid)
@@ -325,7 +323,14 @@ fn main() {
                             .unwrap_or(false))
                 });
 
-                if some_lights_on && all_non_attached_turned_off {
+                // Only groups with attached lights are concerned, otherwise a group of
+                // flaky non-Hue bulbs would get turned off while they are still on
+                let has_attached_lights = group
+                    .lights
+                    .iter()
+                    .any(|light_id| ignored_light_ids.contains(&light_id));
+
+                if has_attached_lights && some_lights_on && all_non_attached_turned_off {
                     println!(
                         "All non-attached lights are unreachable, turning off group: {}",
                         group.name
