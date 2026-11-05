@@ -39,13 +39,7 @@ pub fn get_scheduled_scenes(
             continue;
         };
 
-        let mut sorted_lights = lights.clone();
-        sorted_lights.sort();
-
-        let mut hash = DefaultHasher::new();
-        sorted_lights.hash(&mut hash);
-
-        let scene_id = hash.finish();
+        let scene_id = lights_hash(lights);
 
         // Check if scene is closer to now than this one
         if let Some(last_scene) = scheduled_scenes.get(&scene_id) {
@@ -69,6 +63,16 @@ pub fn get_scheduled_scenes(
         .values()
         .cloned()
         .collect::<Vec<ScheduledScene>>()
+}
+
+/// Identifies a set of lights independently of their order
+pub fn lights_hash(lights: &Vec<String>) -> u64 {
+    let mut sorted_lights = lights.clone();
+    sorted_lights.sort();
+
+    let mut hash = DefaultHasher::new();
+    sorted_lights.hash(&mut hash);
+    hash.finish()
 }
 
 pub fn get_sunrise_sunset(latitude: f64, longitude: f64) -> Option<(u32, u32)> {
