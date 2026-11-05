@@ -301,16 +301,25 @@ fn main() {
                 last_minute = Some(current_minute);
 
                 for scheduled in utils::get_scheduled_scenes(&conf, &parser, &all_scenes).iter() {
-                    match active_scenes.get(&scheduled.lights_hash) {
-                        None => {
-                            // First encounter for this light group — record without applying
-                            // to avoid triggering a slow transition on startup
-                            active_scenes
-                                .insert(scheduled.lights_hash, scheduled.scene_id.clone());
-                            continue;
-                        }
+                    // First encounter for this light group (startup): the lights may still
+                    // hold a scene from an earlier slot, so the current one is applied too
+                    let startup = match active_scenes.get(&scheduled.lights_hash) {
+                        None => true,
                         Some(last_id) if last_id == &scheduled.scene_id => continue,
-                        Some(_) => {}
+                        Some(_) => false,
+                    };
+                    active_scenes.insert(scheduled.lights_hash, scheduled.scene_id.clone());
+
+                    let manual = manual_scene::manual_scene(
+                        scheduled.lights_hash,
+                        &scheduled.scene_id,
+                        &all_scenes,
+                        &active_recalls(&conf),
+                        last_command_time(&conf, &last_commands, scheduled),
+                    );
+                    if let Some(name) = manual {
+                        println!("Scene \"{}\" was chosen by hand, keeping it", name);
+                        continue;
                     }
 
                     // Scene changed for this light group — apply only if lights are ON
@@ -333,7 +342,11 @@ fn main() {
                         .unwrap_or(false);
 
                     if lights_on {
-                        println!("Time slot changed, transitioning to new scene with 5-min transition");
+                        if startup {
+                            println!("Startup, applying scheduled scene to lights already on");
+                        } else {
+                            println!("Time slot changed, transitioning to new scene");
+                        }
                         if let Err(err) = bridge.set_group_state(
                             "0",
                             &StateModifier::new()
@@ -359,8 +372,6 @@ fn main() {
                             conf.scene_transition + conf.scene_confirm_delay,
                         ));
                     }
-
-                    active_scenes.insert(scheduled.lights_hash, scheduled.scene_id.clone());
                 }
             }
         }

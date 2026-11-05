@@ -60,9 +60,31 @@ pub fn manual_scene<'a>(
     all_scenes
         .iter()
         .filter(|scene| scene.id != scheduled_scene_id)
+        // A scene from another time slot of the schedule is left over, not chosen by hand
+        .filter(|scene| !is_scheduled(&scene.name))
         .filter(|scene| {
             scene.lights.as_ref().map(crate::utils::lights_hash) == Some(lights_hash)
         })
         .find(|scene| recalls.get(&scene.id).map(|at| *at > threshold).unwrap_or(false))
         .map(|scene| scene.name.as_str())
+}
+
+/// Whether a scene name holds a time range, e.g. "Jour (10h-sunset)"
+fn is_scheduled(name: &str) -> bool {
+    name.split('(')
+        .skip(1)
+        .any(|part| part.split(')').next().map(|r| r.contains('-')).unwrap_or(false) && part.contains(')'))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_scheduled;
+
+    #[test]
+    fn detects_scheduled_names() {
+        assert!(is_scheduled("Jour (10h-sunset)"));
+        assert!(is_scheduled("Lecture (sunset-23h)"));
+        assert!(!is_scheduled("Lecture"));
+        assert!(!is_scheduled("Film (soir)"));
+    }
 }
