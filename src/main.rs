@@ -297,9 +297,9 @@ fn main() {
                             &conf,
                         );
                     } else {
-                        // Attached lights follow the schedule even while the other lights are
-                        // switched off
-                        apply_attached_lights_scene_state(
+                        // Other lights are switched off: preset the attached lights to the new
+                        // scene and leave them off, so they show it once turned on again
+                        preset_attached_lights_scene_state(
                             &scheduled.scene_id,
                             &all_scenes,
                             &all_lights,
@@ -421,8 +421,9 @@ fn turn_off_orphaned_attached_lights(
     }
 }
 
-/// Sets the attached lights of a scene to the state the scene defines for them
-fn apply_attached_lights_scene_state(
+/// Sets the attached lights of a scene to the state the scene defines for them and turns them
+/// off right after, as the bridge doesn't accept a color for a light that is off
+fn preset_attached_lights_scene_state(
     scene_id: &String,
     all_scenes: &Vec<Scene>,
     all_lights: &Vec<Light>,
@@ -444,9 +445,10 @@ fn apply_attached_lights_scene_state(
             continue;
         };
 
-        state["transitiontime"] = serde_json::json!(conf.scene_transition.as_millis() / 100);
+        state["on"] = serde_json::json!(true);
+        state["transitiontime"] = serde_json::json!(0);
         println!(
-            "Time slot changed, setting attached light \"{}\"",
+            "Time slot changed, presetting attached light \"{}\" and turning it off",
             light.name
         );
 
@@ -455,7 +457,17 @@ fn apply_attached_lights_scene_state(
             conf.bridge_ip, conf.bridge_username, light.id
         );
         if let Err(err) = ureq::put(&url).send_json(state) {
-            eprintln!("Failed to set attached light: {}", err);
+            eprintln!("Failed to preset attached light: {}", err);
+            continue;
+        }
+
+        // Give the light a moment to take the new state before turning it off
+        std::thread::sleep(std::time::Duration::from_secs(1));
+
+        if let Err(err) =
+            ureq::put(&url).send_json(serde_json::json!({ "on": false, "transitiontime": 0 }))
+        {
+            eprintln!("Failed to turn off attached light: {}", err);
         }
     }
 }
