@@ -41,22 +41,7 @@ pub fn get_scheduled_scenes(
             continue;
         };
 
-        // Group by non-attached lights only, so a scene that additionally includes an
-        // attached light competes with (and transitions to) the scenes without it
-        let mut sorted_lights = lights
-            .iter()
-            .filter(|id| !attached_light_ids.contains(id))
-            .cloned()
-            .collect::<Vec<String>>();
-        if sorted_lights.is_empty() {
-            sorted_lights = lights.clone();
-        }
-        sorted_lights.sort();
-
-        let mut hash = DefaultHasher::new();
-        sorted_lights.hash(&mut hash);
-
-        let scene_id = hash.finish();
+        let scene_id = lights_hash(lights, attached_light_ids);
 
         // Check if scene is closer to now than this one
         if let Some(last_scene) = scheduled_scenes.get(&scene_id) {
@@ -80,6 +65,25 @@ pub fn get_scheduled_scenes(
         .values()
         .cloned()
         .collect::<Vec<ScheduledScene>>()
+}
+
+/// Identifies a set of lights independently of their order. Attached lights are left out, so a
+/// scene that additionally includes an attached light competes with (and transitions to) the
+/// scenes without it.
+pub fn lights_hash(lights: &Vec<String>, attached_light_ids: &Vec<&String>) -> u64 {
+    let mut sorted_lights = lights
+        .iter()
+        .filter(|id| !attached_light_ids.contains(id))
+        .cloned()
+        .collect::<Vec<String>>();
+    if sorted_lights.is_empty() {
+        sorted_lights = lights.clone();
+    }
+    sorted_lights.sort();
+
+    let mut hash = DefaultHasher::new();
+    sorted_lights.hash(&mut hash);
+    hash.finish()
 }
 
 pub fn get_sunrise_sunset(latitude: f64, longitude: f64) -> Option<(u32, u32)> {

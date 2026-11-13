@@ -10,6 +10,8 @@ use std::io::{Seek, Write};
 use std::time::Instant;
 
 mod config;
+mod manual_scene;
+mod scene_lights;
 mod time_range_parser;
 mod utils;
 
@@ -19,14 +21,47 @@ struct StateChange {
     pub reachable: bool,
 }
 
+struct PendingConfirm {
+    scene_id: String,
+    lights_hash: u64,
+    lights: Vec<String>,
+    due: Instant,
+}
+
+impl PendingConfirm {
+    fn new(
+        scene_id: &str,
+        lights_hash: u64,
+        all_scenes: &[Scene],
+        delay: std::time::Duration,
+    ) -> Self {
+        PendingConfirm {
+            scene_id: scene_id.to_string(),
+            lights_hash,
+            lights: all_scenes
+                .iter()
+                .find(|s| s.id == scene_id)
+                .and_then(|s| s.lights.clone())
+                .unwrap_or_default(),
+            due: Instant::now() + delay,
+        }
+    }
+}
+
 fn main() {
     let mut light_states = HashMap::<String, StateChange>::new();
     // Tracks the last scene applied per light-group (keyed by sorted-lights hash).
     // Used to detect time-slot changes and avoid redundant transitions.
     let mut active_scenes = HashMap::<u64, String>::new();
+    let mut last_minute: Option<u32> = None;
+    // Scenes to send again once their transition is over, to catch lights
+    // (typically non-Hue bulbs) that missed or aborted the first command.
+    let mut pending_confirms = Vec::<PendingConfirm>::new();
+    // Time of our last scene command per light-group. A scene recalled after it was chosen
+    // by hand (app, remote) and is kept until the next time slot.
+    let mut last_commands = HashMap::<u64, DateTime<Utc>>::new();
     // Last known on-state of attached lights, used to detect them being turned on
     let mut attached_on_states = HashMap::<String, bool>::new();
-    let mut last_minute: Option<u32> = None;
     let mut conf = config::load_config();
     let bridge = Bridge::new(conf.bridge_ip.clone(), &conf.bridge_username);
 
@@ -52,6 +87,55 @@ fn main() {
             Some(ref mut file) => write_debug_file(&all_lights, file),
             None => (),
         };
+
+        // Re-send scenes whose transition is over, if still active and lights still on
+        let (due, waiting): (Vec<PendingConfirm>, Vec<PendingConfirm>) = pending_confirms
+            .drain(..)
+            .partition(|p| p.due <= Instant::now());
+        pending_confirms = waiting;
+        for confirm in due.iter() {
+            let still_active = active_scenes.values().any(|id| id == &confirm.scene_id);
+            let lights_on = confirm.lights.iter().any(|lid| {
+                all_lights
+                    .iter()
+                    .find(|l| &l.id == lid)
+                    .map(|l| l.state.on.unwrap_or(false))
+                    .unwrap_or(false)
+            });
+            if still_active && lights_on {
+                let manual = manual_scene_name(
+                    &conf,
+                    confirm.lights_hash,
+                    &confirm.scene_id,
+                    &all_lights,
+                    last_commands
+                        .get(&confirm.lights_hash)
+                        .copied()
+                        .unwrap_or_else(Utc::now),
+                );
+                if let Some(name) = manual {
+                    println!("Scene \"{}\" was chosen by hand, not re-applying", name);
+                    continue;
+                }
+                println!("Re-applying scene to catch lights that missed the transition");
+                if let Err(err) = bridge.set_group_state(
+                    "0",
+                    &StateModifier::new()
+                        .with_scene(confirm.scene_id.clone())
+                        .with_transition_time(10),
+                ) {
+                    eprintln!("Failed to re-apply scene: {}", err);
+                }
+                scene_lights::apply_to_non_hue_lights(
+                    &conf.bridge_ip,
+                    &conf.bridge_username,
+                    &confirm.scene_id,
+                    &all_lights,
+                    10,
+                );
+                last_commands.insert(confirm.lights_hash, Utc::now());
+            }
+        }
 
         let changed_lights = all_lights
             .iter()
@@ -97,11 +181,7 @@ fn main() {
             );
         }
 
-        let ignored_light_ids = all_lights
-            .iter()
-            .filter(|light| utils::is_attached_light(light))
-            .map(|light| &light.id)
-            .collect::<Vec<&String>>();
+        let ignored_light_ids = attached_light_ids(&all_lights);
 
         let turned_on_attached_ids = all_lights
             .iter()
@@ -220,14 +300,37 @@ fn main() {
                 )
                 .iter()
                 {
-                    if let Err(err) = bridge.set_group_state(
+                    let manual = manual_scene::manual_scene(
+                        scheduled.lights_hash,
                         &scheduled.scene_id,
+                        &all_scenes,
+                        &ignored_light_ids,
+                        &active_recalls(&conf),
+                        last_command_time(&conf, &last_commands, scheduled),
+                    );
+                    if let Some(name) = manual {
+                        println!(
+                            "Lights reachable again but scene \"{}\" was chosen by hand, keeping it",
+                            name
+                        );
+                        continue;
+                    }
+                    println!("Lights switched on, applying scheduled scene");
+                    if let Err(err) = bridge.set_group_state(
+                        "0",
                         &StateModifier::new()
                             .with_scene(scheduled.scene_id.clone())
                             .with_transition_time(10),
                     ) {
                         eprintln!("Failed to set scene: {}", err);
                     }
+                    scene_lights::apply_to_non_hue_lights(
+                        &conf.bridge_ip,
+                        &conf.bridge_username,
+                        &scheduled.scene_id,
+                        &all_lights,
+                        10,
+                    );
                     turn_off_orphaned_attached_lights(
                         &bridge,
                         &scheduled.scene_id,
@@ -236,6 +339,13 @@ fn main() {
                         &conf,
                     );
                     active_scenes.insert(scheduled.lights_hash, scheduled.scene_id.clone());
+                    last_commands.insert(scheduled.lights_hash, Utc::now());
+                    pending_confirms.push(PendingConfirm::new(
+                        &scheduled.scene_id,
+                        scheduled.lights_hash,
+                        &all_scenes,
+                        conf.scene_confirm_delay,
+                    ));
                 }
             }
 
@@ -288,15 +398,26 @@ fn main() {
                 }
 
                 for scheduled in scheduled_scenes.iter() {
-                    match active_scenes.get(&scheduled.lights_hash) {
-                        None => {
-                            // First encounter for this light group — record without applying
-                            // to avoid triggering a slow transition on startup
-                            active_scenes.insert(scheduled.lights_hash, scheduled.scene_id.clone());
-                            continue;
-                        }
+                    // First encounter for this light group (startup): the lights may still
+                    // hold a scene from an earlier slot, so the current one is applied too
+                    let startup = match active_scenes.get(&scheduled.lights_hash) {
+                        None => true,
                         Some(last_id) if last_id == &scheduled.scene_id => continue,
-                        Some(_) => {}
+                        Some(_) => false,
+                    };
+                    active_scenes.insert(scheduled.lights_hash, scheduled.scene_id.clone());
+
+                    let manual = manual_scene::manual_scene(
+                        scheduled.lights_hash,
+                        &scheduled.scene_id,
+                        &all_scenes,
+                        &ignored_light_ids,
+                        &active_recalls(&conf),
+                        last_command_time(&conf, &last_commands, scheduled),
+                    );
+                    if let Some(name) = manual {
+                        println!("Scene \"{}\" was chosen by hand, keeping it", name);
+                        continue;
                     }
 
                     // Scene changed for this light group — apply only if lights are ON
@@ -305,9 +426,10 @@ fn main() {
                         .find(|s| s.id == scheduled.scene_id)
                         .and_then(|s| s.lights.as_ref())
                         .map(|lights| {
+                            // Reachability is ignored: non-Hue bulbs are often reported
+                            // unreachable while still accepting commands
                             lights.iter().any(|lid| {
                                 !ignored_light_ids.contains(&lid)
-                                    && light_states.get(lid).map(|s| s.reachable).unwrap_or(false)
                                     && all_lights
                                         .iter()
                                         .find(|l| &l.id == lid)
@@ -318,11 +440,13 @@ fn main() {
                         .unwrap_or(false);
 
                     if lights_on {
-                        println!(
-                            "Time slot changed, transitioning to new scene with 5-min transition"
-                        );
+                        if startup {
+                            println!("Startup, applying scheduled scene to lights already on");
+                        } else {
+                            println!("Time slot changed, transitioning to new scene");
+                        }
                         if let Err(err) = bridge.set_group_state(
-                            &scheduled.scene_id,
+                            "0",
                             &StateModifier::new()
                                 .with_scene(scheduled.scene_id.clone())
                                 .with_transition_time(
@@ -331,6 +455,20 @@ fn main() {
                         ) {
                             eprintln!("Failed to auto-transition scene: {}", err);
                         }
+                        scene_lights::apply_to_non_hue_lights(
+                            &conf.bridge_ip,
+                            &conf.bridge_username,
+                            &scheduled.scene_id,
+                            &all_lights,
+                            (conf.scene_transition.as_millis() / 100) as u16,
+                        );
+                        last_commands.insert(scheduled.lights_hash, Utc::now());
+                        pending_confirms.push(PendingConfirm::new(
+                            &scheduled.scene_id,
+                            scheduled.lights_hash,
+                            &all_scenes,
+                            conf.scene_transition + conf.scene_confirm_delay,
+                        ));
                         turn_off_orphaned_attached_lights(
                             &bridge,
                             &scheduled.scene_id,
@@ -338,7 +476,7 @@ fn main() {
                             &all_lights,
                             &conf,
                         );
-                    } else {
+                    } else if !startup {
                         // Other lights are switched off: turn the attached lights of the new
                         // scene off too, they're set to it once turned on again (Case 3)
                         turn_off_attached_lights(
@@ -355,8 +493,6 @@ fn main() {
                             &conf,
                         );
                     }
-
-                    active_scenes.insert(scheduled.lights_hash, scheduled.scene_id.clone());
                 }
             }
         }
@@ -385,7 +521,14 @@ fn main() {
                             .unwrap_or(false))
                 });
 
-                if some_lights_on && all_non_attached_turned_off {
+                // Only groups with attached lights are concerned, otherwise a group of
+                // flaky non-Hue bulbs would get turned off while they are still on
+                let has_attached_lights = group
+                    .lights
+                    .iter()
+                    .any(|light_id| ignored_light_ids.contains(&light_id));
+
+                if has_attached_lights && some_lights_on && all_non_attached_turned_off {
                     println!(
                         "All non-attached lights are unreachable, turning off group: {}",
                         group.name
@@ -401,6 +544,53 @@ fn main() {
             }
         }
     }
+}
+
+/// Time after which a recalled scene counts as chosen by hand: our last command for these
+/// lights, but never before the start of the current time slot (a choice made during a
+/// previous slot no longer applies).
+fn last_command_time(
+    conf: &config::Config,
+    last_commands: &HashMap<u64, DateTime<Utc>>,
+    scheduled: &utils::ScheduledScene,
+) -> DateTime<Utc> {
+    let now = Utc::now().with_timezone(&conf.home_timezone);
+    let now_minute = now.hour() * 60 + now.minute();
+    let minutes_since_start = (now_minute + 24 * 60 - scheduled.start) % (24 * 60);
+    let slot_start = (now
+        - chrono::Duration::minutes(minutes_since_start as i64)
+        - chrono::Duration::seconds(now.second() as i64))
+    .with_timezone(&Utc);
+
+    last_commands
+        .get(&scheduled.lights_hash)
+        .copied()
+        .map(|t| t.max(slot_start))
+        .unwrap_or(slot_start)
+}
+
+fn active_recalls(conf: &config::Config) -> HashMap<String, DateTime<Utc>> {
+    manual_scene::active_scene_recalls(&conf.bridge_ip, &conf.bridge_username).unwrap_or_default()
+}
+
+fn manual_scene_name(
+    conf: &config::Config,
+    lights_hash: u64,
+    scene_id: &str,
+    all_lights: &Vec<Light>,
+    last_command: DateTime<Utc>,
+) -> Option<String> {
+    let bridge = Bridge::new(conf.bridge_ip.clone(), &conf.bridge_username);
+    let all_scenes = bridge.get_all_scenes().ok()?;
+    manual_scene::manual_scene(
+        lights_hash,
+        scene_id,
+        &all_scenes,
+        &attached_light_ids(all_lights),
+        &active_recalls(conf),
+        last_command,
+    )
+    .map(str::to_string)
 }
 
 /// Turns off attached lights in the scene's room that the scene itself doesn't control, as long
@@ -538,6 +728,14 @@ fn get_scene_light_state(
             None
         }
     }
+}
+
+fn attached_light_ids(all_lights: &Vec<Light>) -> Vec<&String> {
+    all_lights
+        .iter()
+        .filter(|light| utils::is_attached_light(light))
+        .map(|light| &light.id)
+        .collect::<Vec<&String>>()
 }
 
 fn write_debug_file(lights: &Vec<Light>, file: &mut File) {
