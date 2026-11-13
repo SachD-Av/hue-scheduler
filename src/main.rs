@@ -201,10 +201,51 @@ fn main() {
             if minute_changed {
                 last_minute = Some(current_minute);
 
-                for scheduled in
-                    utils::get_scheduled_scenes(&conf, &parser, &all_scenes, &ignored_light_ids)
+                let scheduled_scenes =
+                    utils::get_scheduled_scenes(&conf, &parser, &all_scenes, &ignored_light_ids);
+
+                // Scenes whose time slot ended without a following one: turn off the attached
+                // lights they set, the other lights are left as they are
+                for (lights_hash, last_id) in active_scenes.iter_mut() {
+                    if last_id.is_empty()
+                        || scheduled_scenes
+                            .iter()
+                            .any(|scheduled| &scheduled.lights_hash == lights_hash)
+                    {
+                        continue;
+                    }
+
+                    if let Some(lights) = all_scenes
                         .iter()
-                {
+                        .find(|scene| &scene.id == last_id)
+                        .and_then(|scene| scene.lights.as_ref())
+                    {
+                        for light in all_lights.iter().filter(|light| {
+                            utils::is_attached_light(light) && lights.contains(&light.id)
+                        }) {
+                            if get_scene_light_state(&conf, last_id, &light.id)
+                                .map(|state| utils::matches_scene_state(light, &state))
+                                .unwrap_or(false)
+                            {
+                                println!(
+                                    "Scene ended, turning off attached light \"{}\"",
+                                    light.name
+                                );
+                                if let Err(err) = bridge.set_light_state(
+                                    &light.id,
+                                    &LightStateModifier::new().with_on(false),
+                                ) {
+                                    eprintln!("Failed to turn off attached light: {}", err);
+                                }
+                            }
+                        }
+                    }
+
+                    // Empty marks "no scene", so the next scene for these lights transitions
+                    last_id.clear();
+                }
+
+                for scheduled in scheduled_scenes.iter() {
                     match active_scenes.get(&scheduled.lights_hash) {
                         None => {
                             // First encounter for this light group — record without applying
@@ -248,6 +289,22 @@ fn main() {
                         ) {
                             eprintln!("Failed to auto-transition scene: {}", err);
                         }
+                        turn_off_orphaned_attached_lights(
+                            &bridge,
+                            &scheduled.scene_id,
+                            &all_scenes,
+                            &all_lights,
+                            &conf,
+                        );
+                    } else {
+                        // Attached lights follow the schedule even while the other lights are
+                        // switched off
+                        apply_attached_lights_scene_state(
+                            &scheduled.scene_id,
+                            &all_scenes,
+                            &all_lights,
+                            &conf,
+                        );
                         turn_off_orphaned_attached_lights(
                             &bridge,
                             &scheduled.scene_id,
@@ -360,6 +417,45 @@ fn turn_off_orphaned_attached_lights(
             bridge.set_light_state(&light_id, &LightStateModifier::new().with_on(false))
         {
             eprintln!("Failed to turn off attached light: {}", err);
+        }
+    }
+}
+
+/// Sets the attached lights of a scene to the state the scene defines for them
+fn apply_attached_lights_scene_state(
+    scene_id: &String,
+    all_scenes: &Vec<Scene>,
+    all_lights: &Vec<Light>,
+    conf: &config::Config,
+) {
+    let Some(scene_lights) = all_scenes
+        .iter()
+        .find(|scene| &scene.id == scene_id)
+        .and_then(|scene| scene.lights.as_ref())
+    else {
+        return;
+    };
+
+    for light in all_lights
+        .iter()
+        .filter(|light| utils::is_attached_light(light) && scene_lights.contains(&light.id))
+    {
+        let Some(mut state) = get_scene_light_state(conf, scene_id, &light.id) else {
+            continue;
+        };
+
+        state["transitiontime"] = serde_json::json!(conf.scene_transition.as_millis() / 100);
+        println!(
+            "Time slot changed, setting attached light \"{}\"",
+            light.name
+        );
+
+        let url = format!(
+            "http://{}/api/{}/lights/{}/state",
+            conf.bridge_ip, conf.bridge_username, light.id
+        );
+        if let Err(err) = ureq::put(&url).send_json(state) {
+            eprintln!("Failed to set attached light: {}", err);
         }
     }
 }
