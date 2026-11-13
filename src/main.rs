@@ -27,6 +27,8 @@ fn main() {
     // Attached lights turned on by a scene applied here. Attached lights turned on manually
     // (e.g. with a remote) are never in here and are thus left on on scene changes.
     let mut scene_attached_lights = HashSet::<String>::new();
+    // Last known on-state of attached lights, used to detect them being turned on manually
+    let mut attached_on_states = HashMap::<String, bool>::new();
     let mut last_minute: Option<u32> = None;
     let mut conf = config::load_config();
     let bridge = Bridge::new(conf.bridge_ip.clone(), &conf.bridge_username);
@@ -110,6 +112,24 @@ fn main() {
                 .any(|light| &light.id == id && light.state.on.unwrap_or(false))
         });
 
+        let manually_turned_on_ids = all_lights
+            .iter()
+            .filter(|light| {
+                utils::is_attached_light(light)
+                    && light.state.on.unwrap_or(false)
+                    && !scene_attached_lights.contains(&light.id)
+                    && attached_on_states.get(&light.id) == Some(&false)
+            })
+            .map(|light| &light.id)
+            .collect::<Vec<&String>>();
+
+        for light in all_lights
+            .iter()
+            .filter(|light| utils::is_attached_light(light))
+        {
+            attached_on_states.insert(light.id.clone(), light.state.on.unwrap_or(false));
+        }
+
         let light_trigger_ids = light_states
             .iter()
             .filter(|(_, state)| {
@@ -126,8 +146,9 @@ fn main() {
         let current_minute = date_time.hour() * 60 + date_time.minute();
         let minute_changed = last_minute != Some(current_minute);
 
-        // Run scene logic when lights are triggered (Case 1) or when the minute changes (Case 2)
-        if !light_trigger_ids.is_empty() || minute_changed {
+        // Run scene logic when lights are triggered (Case 1), when the minute changes (Case 2)
+        // or when attached lights were turned on manually (Case 3)
+        if !light_trigger_ids.is_empty() || minute_changed || !manually_turned_on_ids.is_empty() {
             let Ok(all_scenes) = bridge.get_all_scenes() else {
                 eprintln!("Failed to retrieve scenes");
                 continue;
@@ -145,6 +166,28 @@ fn main() {
                 ("sunrise".to_string(), sunrise),
                 ("sunset".to_string(), sunset),
             ]));
+
+            // Case 3: attached light turned on manually while a scene including it is scheduled —
+            // treat it as part of that scene so it's turned off once the scene ends
+            if !manually_turned_on_ids.is_empty() {
+                let scheduled_scenes =
+                    utils::get_scheduled_scenes(&conf, &parser, &all_scenes, &ignored_light_ids);
+
+                for light_id in manually_turned_on_ids.iter() {
+                    let in_scheduled_scene = scheduled_scenes.iter().any(|scheduled| {
+                        all_scenes
+                            .iter()
+                            .find(|scene| scene.id == scheduled.scene_id)
+                            .and_then(|scene| scene.lights.as_ref())
+                            .map(|lights| lights.contains(light_id))
+                            .unwrap_or(false)
+                    });
+
+                    if in_scheduled_scene {
+                        scene_attached_lights.insert((*light_id).clone());
+                    }
+                }
+            }
 
             // Case 1: light was just switched on — apply the current scheduled scene immediately
             if !light_trigger_ids.is_empty() {
