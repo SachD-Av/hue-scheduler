@@ -34,6 +34,11 @@ Currently, the only way to install this app is to clone this repository and buil
 > After installation and setup (e.g. the app is running) nothing needs to be done anymore.  
 > Anything else is configured in your Philips Hue app!
 
+#### Raspberry Pi: prebuilt binaries
+
+Compiling on a Raspberry Pi can run out of memory. Every push to `main` publishes static binaries for 64-bit (`aarch64`) and 32-bit (`armv7l`) Pis as the [`latest` release](https://github.com/SachD-Av/hue-scheduler/releases/tag/latest).
+After cloning, run `./scripts/update.sh` (instead of step 4) to download the one for your Pi into `target/release/` and restart the service; run it again to update.
+
 #### Installing as system service
 
 You will probably want to run this as a service in the background, for this you could use `.service` file like this (assuming you downloaded and compiled the source under `/home/ubuntu/hue-scheduler`):

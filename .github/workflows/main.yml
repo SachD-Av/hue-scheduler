@@ -11,10 +11,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Set up cache
-        uses: actions/cache@v3
+        uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/bin/
@@ -30,8 +30,59 @@ jobs:
       - name: Run tests
         run: cargo test --verbose
 
-      - name: Upload build artifact
-        uses: actions/upload-artifact@v3
+  # Static binaries for Raspberry Pis, so they don't have to compile anything themselves
+  build_pi:
+    name: Build for ${{ matrix.target }}
+    needs: build_and_test
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - target: aarch64-unknown-linux-musl
+            arch: aarch64
+          - target: armv7-unknown-linux-musleabihf
+            arch: armv7l
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install cross
+        uses: taiki-e/install-action@v2
         with:
-          name: hue-scheduler
-          path: target/release/hue-scheduler
+          tool: cross
+
+      - name: Build
+        run: cross build --release --locked --target ${{ matrix.target }}
+
+      - name: Rename binary
+        run: cp target/${{ matrix.target }}/release/hue-scheduler hue-scheduler-${{ matrix.arch }}
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: hue-scheduler-${{ matrix.arch }}
+          path: hue-scheduler-${{ matrix.arch }}
+
+  release:
+    name: Publish "latest" release
+    needs: build_pi
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download binaries
+        uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - name: Replace release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release delete latest --cleanup-tag --yes || true
+          gh release create latest hue-scheduler-* \
+            --title "Latest build" \
+            --notes "Built from ${{ github.sha }}" \
+            --target ${{ github.sha }}
