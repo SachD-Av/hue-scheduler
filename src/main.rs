@@ -4,7 +4,7 @@ use huelib2::resource::group::StateModifier;
 use huelib2::resource::light::StateModifier as LightStateModifier;
 use huelib2::resource::{Light, Scene};
 use huelib2::Bridge;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Seek, Write};
 use std::time::Instant;
@@ -24,11 +24,6 @@ fn main() {
     // Tracks the last scene applied per light-group (keyed by sorted-lights hash).
     // Used to detect time-slot changes and avoid redundant transitions.
     let mut active_scenes = HashMap::<u64, String>::new();
-    // Attached lights turned on by a scene applied here. Attached lights turned on manually
-    // (e.g. with a remote) are never in here and are thus left on on scene changes.
-    let mut scene_attached_lights = HashSet::<String>::new();
-    // Last known on-state of attached lights, used to detect them being turned on manually
-    let mut attached_on_states = HashMap::<String, bool>::new();
     let mut last_minute: Option<u32> = None;
     let mut conf = config::load_config();
     let bridge = Bridge::new(conf.bridge_ip.clone(), &conf.bridge_username);
@@ -106,30 +101,6 @@ fn main() {
             .map(|light| &light.id)
             .collect::<Vec<&String>>();
 
-        scene_attached_lights.retain(|id| {
-            all_lights
-                .iter()
-                .any(|light| &light.id == id && light.state.on.unwrap_or(false))
-        });
-
-        let manually_turned_on_ids = all_lights
-            .iter()
-            .filter(|light| {
-                utils::is_attached_light(light)
-                    && light.state.on.unwrap_or(false)
-                    && !scene_attached_lights.contains(&light.id)
-                    && attached_on_states.get(&light.id) == Some(&false)
-            })
-            .map(|light| &light.id)
-            .collect::<Vec<&String>>();
-
-        for light in all_lights
-            .iter()
-            .filter(|light| utils::is_attached_light(light))
-        {
-            attached_on_states.insert(light.id.clone(), light.state.on.unwrap_or(false));
-        }
-
         let light_trigger_ids = light_states
             .iter()
             .filter(|(_, state)| {
@@ -146,9 +117,8 @@ fn main() {
         let current_minute = date_time.hour() * 60 + date_time.minute();
         let minute_changed = last_minute != Some(current_minute);
 
-        // Run scene logic when lights are triggered (Case 1), when the minute changes (Case 2)
-        // or when attached lights were turned on manually (Case 3)
-        if !light_trigger_ids.is_empty() || minute_changed || !manually_turned_on_ids.is_empty() {
+        // Run scene logic when lights are triggered (Case 1) or when the minute changes (Case 2)
+        if !light_trigger_ids.is_empty() || minute_changed {
             let Ok(all_scenes) = bridge.get_all_scenes() else {
                 eprintln!("Failed to retrieve scenes");
                 continue;
@@ -166,28 +136,6 @@ fn main() {
                 ("sunrise".to_string(), sunrise),
                 ("sunset".to_string(), sunset),
             ]));
-
-            // Case 3: attached light turned on manually while a scene including it is scheduled —
-            // treat it as part of that scene so it's turned off once the scene ends
-            if !manually_turned_on_ids.is_empty() {
-                let scheduled_scenes =
-                    utils::get_scheduled_scenes(&conf, &parser, &all_scenes, &ignored_light_ids);
-
-                for light_id in manually_turned_on_ids.iter() {
-                    let in_scheduled_scene = scheduled_scenes.iter().any(|scheduled| {
-                        all_scenes
-                            .iter()
-                            .find(|scene| scene.id == scheduled.scene_id)
-                            .and_then(|scene| scene.lights.as_ref())
-                            .map(|lights| lights.contains(light_id))
-                            .unwrap_or(false)
-                    });
-
-                    if in_scheduled_scene {
-                        scene_attached_lights.insert((*light_id).clone());
-                    }
-                }
-            }
 
             // Case 1: light was just switched on — apply the current scheduled scene immediately
             if !light_trigger_ids.is_empty() {
@@ -243,7 +191,7 @@ fn main() {
                         &scheduled.scene_id,
                         &all_scenes,
                         &all_lights,
-                        &mut scene_attached_lights,
+                        &conf,
                     );
                     active_scenes.insert(scheduled.lights_hash, scheduled.scene_id.clone());
                 }
@@ -305,7 +253,7 @@ fn main() {
                             &scheduled.scene_id,
                             &all_scenes,
                             &all_lights,
-                            &mut scene_attached_lights,
+                            &conf,
                         );
                     }
 
@@ -356,14 +304,14 @@ fn main() {
     }
 }
 
-/// Turns off attached lights in the scene's room that the scene itself doesn't control,
-/// unless they were turned on manually rather than by a previous scene
+/// Turns off attached lights in the scene's room that the scene itself doesn't control, as long
+/// as they still look like another scene set them (i.e. they weren't changed manually)
 fn turn_off_orphaned_attached_lights(
     bridge: &Bridge,
     scene_id: &String,
     all_scenes: &Vec<Scene>,
     all_lights: &Vec<Light>,
-    scene_attached_lights: &mut HashSet<String>,
+    conf: &config::Config,
 ) {
     let Some(scene_lights) = all_scenes
         .iter()
@@ -373,19 +321,34 @@ fn turn_off_orphaned_attached_lights(
         return;
     };
 
-    for light in all_lights.iter() {
-        if utils::is_attached_light(light) && scene_lights.contains(&light.id) {
-            scene_attached_lights.insert(light.id.clone());
-        }
-    }
-
     let Ok(all_groups) = bridge.get_all_groups() else {
         eprintln!("Failed to retrieve groups");
         return;
     };
 
     for light_id in utils::get_orphaned_attached_lights(scene_lights, &all_groups, all_lights) {
-        if !scene_attached_lights.remove(&light_id) {
+        let Some(light) = all_lights.iter().find(|light| light.id == light_id) else {
+            continue;
+        };
+
+        let set_by_scene = all_scenes
+            .iter()
+            .filter(|scene| {
+                &scene.id != scene_id
+                    && scene
+                        .lights
+                        .as_ref()
+                        .map(|lights| lights.contains(&light_id))
+                        .unwrap_or(false)
+            })
+            .filter_map(|scene| get_scene_light_state(conf, &scene.id, &light_id))
+            .any(|scene_state| utils::matches_scene_state(light, &scene_state));
+
+        if !set_by_scene {
+            println!(
+                "Leaving attached light {} on, it doesn't match any of its scenes",
+                light_id
+            );
             continue;
         }
 
@@ -397,6 +360,30 @@ fn turn_off_orphaned_attached_lights(
             bridge.set_light_state(&light_id, &LightStateModifier::new().with_on(false))
         {
             eprintln!("Failed to turn off attached light: {}", err);
+        }
+    }
+}
+
+/// Fetches the state a scene sets for one of its lights, which huelib2 doesn't expose
+fn get_scene_light_state(
+    conf: &config::Config,
+    scene_id: &String,
+    light_id: &String,
+) -> Option<serde_json::Value> {
+    let url = format!(
+        "http://{}/api/{}/scenes/{}",
+        conf.bridge_ip, conf.bridge_username, scene_id
+    );
+
+    match ureq::get(&url)
+        .call()
+        .ok()
+        .and_then(|response| response.into_json::<serde_json::Value>().ok())
+    {
+        Some(scene) => scene["lightstates"].get(light_id).cloned(),
+        None => {
+            eprintln!("Failed to retrieve scene {}", scene_id);
+            None
         }
     }
 }

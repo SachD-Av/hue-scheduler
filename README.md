@@ -94,8 +94,8 @@ Since it takes some time for the hue bridge to recognize no longer reachable lig
 Still better than doing it manually ;)
 
 An attached light can also be part of only some of your scenes, e.g. a night light that should only be on during **Rest (13h-15h)**.
-Whenever a scene is applied, attached lights in the same room that were turned on by a previous scene but are not part of the new one are turned off.
-Attached lights you turned on manually (e.g. with a remote) are left on, unless you did so while a scene including them was scheduled.
+Whenever a scene is applied, attached lights in the same room that are not part of that scene are turned off.
+If you changed such a light manually (e.g. another color or brightness with a remote) so it doesn't match any of its scenes anymore, it is left on.
 
 ### Screenshots
 

@@ -124,3 +124,40 @@ pub fn get_orphaned_attached_lights(
         .cloned()
         .collect::<Vec<String>>()
 }
+
+/// Returns whether the light currently shows the state a scene sets for it (e.g. the
+/// `lightstates` entry of a scene), with some tolerance for rounding by the light itself
+pub fn matches_scene_state(light: &Light, scene_state: &serde_json::Value) -> bool {
+    let state = &light.state;
+
+    if !state.on.unwrap_or(false) || scene_state["on"].as_bool() == Some(false) {
+        return false;
+    }
+
+    let close = |current: Option<f64>, expected: &serde_json::Value, tolerance: f64| match (
+        current,
+        expected.as_f64(),
+    ) {
+        (Some(current), Some(expected)) => (current - expected).abs() <= tolerance,
+        (_, None) => true,
+        (None, Some(_)) => false,
+    };
+
+    let color_matches = if let Some(xy) = scene_state["xy"].as_array() {
+        match (state.color_space_coordinates, xy.as_slice()) {
+            (Some((x, y)), [ex, ey]) => {
+                close(Some(x as f64), ex, 0.03) && close(Some(y as f64), ey, 0.03)
+            }
+            _ => false,
+        }
+    } else {
+        close(
+            state.color_temperature.map(f64::from),
+            &scene_state["ct"],
+            15.0,
+        ) && close(state.hue.map(f64::from), &scene_state["hue"], 1000.0)
+            && close(state.saturation.map(f64::from), &scene_state["sat"], 15.0)
+    };
+
+    color_matches && close(state.brightness.map(f64::from), &scene_state["bri"], 10.0)
+}
