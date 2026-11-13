@@ -96,7 +96,7 @@ Still better than doing it manually ;)
 An attached light can also be part of only some of your scenes, e.g. a night light that should only be on during **Rest (13h-15h)**.
 Whenever a scene is applied, attached lights in the same room that are not part of that scene are turned off.
 If you changed such a light manually (e.g. another color or brightness with a remote) so it doesn't match any of its scenes anymore, it is left on.
-Attached lights also follow the schedule while the other lights are switched off: when a scene including them starts, they are briefly set to it and turned off again, so they show it once turned on (e.g. with a remote). When it ends they are turned off unless changed manually.
+Attached lights also follow the schedule while the other lights are switched off: when a scene including them starts, they are turned off, and once you turn them on again (e.g. with a remote) they are set to that scene. When it ends they are turned off unless changed manually.
 
 ### Screenshots
 
