@@ -4,7 +4,7 @@ use huelib2::resource::group::StateModifier;
 use huelib2::resource::light::StateModifier as LightStateModifier;
 use huelib2::resource::{Light, Scene};
 use huelib2::Bridge;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{Seek, Write};
 use std::time::Instant;
@@ -24,6 +24,9 @@ fn main() {
     // Tracks the last scene applied per light-group (keyed by sorted-lights hash).
     // Used to detect time-slot changes and avoid redundant transitions.
     let mut active_scenes = HashMap::<u64, String>::new();
+    // Attached lights turned on by a scene applied here. Attached lights turned on manually
+    // (e.g. with a remote) are never in here and are thus left on on scene changes.
+    let mut scene_attached_lights = HashSet::<String>::new();
     let mut last_minute: Option<u32> = None;
     let mut conf = config::load_config();
     let bridge = Bridge::new(conf.bridge_ip.clone(), &conf.bridge_username);
@@ -100,6 +103,12 @@ fn main() {
             .filter(|light| utils::is_attached_light(light))
             .map(|light| &light.id)
             .collect::<Vec<&String>>();
+
+        scene_attached_lights.retain(|id| {
+            all_lights
+                .iter()
+                .any(|light| &light.id == id && light.state.on.unwrap_or(false))
+        });
 
         let light_trigger_ids = light_states
             .iter()
@@ -191,6 +200,7 @@ fn main() {
                         &scheduled.scene_id,
                         &all_scenes,
                         &all_lights,
+                        &mut scene_attached_lights,
                     );
                     active_scenes.insert(scheduled.lights_hash, scheduled.scene_id.clone());
                 }
@@ -252,6 +262,7 @@ fn main() {
                             &scheduled.scene_id,
                             &all_scenes,
                             &all_lights,
+                            &mut scene_attached_lights,
                         );
                     }
 
@@ -302,12 +313,14 @@ fn main() {
     }
 }
 
-/// Turns off attached lights in the scene's room that the scene itself doesn't control
+/// Turns off attached lights in the scene's room that the scene itself doesn't control,
+/// unless they were turned on manually rather than by a previous scene
 fn turn_off_orphaned_attached_lights(
     bridge: &Bridge,
     scene_id: &String,
     all_scenes: &Vec<Scene>,
     all_lights: &Vec<Light>,
+    scene_attached_lights: &mut HashSet<String>,
 ) {
     let Some(scene_lights) = all_scenes
         .iter()
@@ -317,12 +330,22 @@ fn turn_off_orphaned_attached_lights(
         return;
     };
 
+    for light in all_lights.iter() {
+        if utils::is_attached_light(light) && scene_lights.contains(&light.id) {
+            scene_attached_lights.insert(light.id.clone());
+        }
+    }
+
     let Ok(all_groups) = bridge.get_all_groups() else {
         eprintln!("Failed to retrieve groups");
         return;
     };
 
     for light_id in utils::get_orphaned_attached_lights(scene_lights, &all_groups, all_lights) {
+        if !scene_attached_lights.remove(&light_id) {
+            continue;
+        }
+
         println!(
             "Turning off attached light {} not part of the new scene",
             light_id
