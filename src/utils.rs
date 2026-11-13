@@ -1,7 +1,8 @@
 use crate::config::Config;
 use crate::time_range_parser::TimeRangeParser;
 use chrono::{DateTime, Local, Timelike, Utc};
-use huelib2::resource::{Light, Scene};
+use huelib2::resource::group::{CreatableKind, Kind};
+use huelib2::resource::{Group, Light, Scene};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
@@ -19,6 +20,7 @@ pub fn get_scheduled_scenes(
     conf: &Config,
     parser: &TimeRangeParser,
     scenes: &Vec<Scene>,
+    attached_light_ids: &Vec<&String>,
 ) -> Vec<ScheduledScene> {
     let mut scheduled_scenes = HashMap::<u64, ScheduledScene>::new();
     let date_time = DateTime::<Utc>::from(Local::now()).with_timezone(&conf.home_timezone);
@@ -39,7 +41,16 @@ pub fn get_scheduled_scenes(
             continue;
         };
 
-        let mut sorted_lights = lights.clone();
+        // Group by non-attached lights only, so a scene that additionally includes an
+        // attached light competes with (and transitions to) the scenes without it
+        let mut sorted_lights = lights
+            .iter()
+            .filter(|id| !attached_light_ids.contains(id))
+            .cloned()
+            .collect::<Vec<String>>();
+        if sorted_lights.is_empty() {
+            sorted_lights = lights.clone();
+        }
         sorted_lights.sort();
 
         let mut hash = DefaultHasher::new();
@@ -86,4 +97,30 @@ pub fn get_sunrise_sunset(latitude: f64, longitude: f64) -> Option<(u32, u32)> {
 
 pub fn is_attached_light(light: &Light) -> bool {
     light.name.ends_with("(att)")
+}
+
+/// Returns attached lights that share a room with the scene's lights but are not part of the
+/// scene itself and are currently on. Recalling the scene leaves them untouched otherwise.
+pub fn get_orphaned_attached_lights(
+    scene_lights: &Vec<String>,
+    groups: &Vec<Group>,
+    lights: &Vec<Light>,
+) -> Vec<String> {
+    groups
+        .iter()
+        .filter(|group| {
+            group.kind == Kind::Creatable(CreatableKind::Room)
+                && group.lights.iter().any(|id| scene_lights.contains(id))
+        })
+        .flat_map(|group| group.lights.iter())
+        .filter(|id| !scene_lights.contains(id))
+        .filter(|id| {
+            lights
+                .iter()
+                .find(|light| &light.id == *id)
+                .map(|light| is_attached_light(light) && light.state.on.unwrap_or(false))
+                .unwrap_or(false)
+        })
+        .cloned()
+        .collect::<Vec<String>>()
 }

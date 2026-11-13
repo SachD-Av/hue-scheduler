@@ -93,6 +93,9 @@ Now, if you flip the physical switch and the light is turned off the lights that
 Since it takes some time for the hue bridge to recognize no longer reachable lights this may take up to a minute.
 Still better than doing it manually ;)
 
+An attached light can also be part of only some of your scenes, e.g. a night light that should only be on during **Rest (13h-15h)**.
+Whenever a scene is applied, attached lights in the same room that are not part of that scene are turned off.
+
 ### Screenshots
 
 This is how it will usually look like in the app.

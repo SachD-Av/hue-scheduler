@@ -1,6 +1,7 @@
 use crate::time_range_parser::TimeRangeParser;
 use chrono::{DateTime, Local, Timelike, Utc};
 use huelib2::resource::group::StateModifier;
+use huelib2::resource::light::StateModifier as LightStateModifier;
 use huelib2::resource::{Light, Scene};
 use huelib2::Bridge;
 use std::collections::HashMap;
@@ -169,8 +170,13 @@ fn main() {
                     }
                 }
 
-                for scheduled in
-                    utils::get_scheduled_scenes(&conf, &parser, &triggered_scenes).iter()
+                for scheduled in utils::get_scheduled_scenes(
+                    &conf,
+                    &parser,
+                    &triggered_scenes,
+                    &ignored_light_ids,
+                )
+                .iter()
                 {
                     if let Err(err) = bridge.set_group_state(
                         &scheduled.scene_id,
@@ -180,6 +186,12 @@ fn main() {
                     ) {
                         eprintln!("Failed to set scene: {}", err);
                     }
+                    turn_off_orphaned_attached_lights(
+                        &bridge,
+                        &scheduled.scene_id,
+                        &all_scenes,
+                        &all_lights,
+                    );
                     active_scenes.insert(scheduled.lights_hash, scheduled.scene_id.clone());
                 }
             }
@@ -188,13 +200,15 @@ fn main() {
             if minute_changed {
                 last_minute = Some(current_minute);
 
-                for scheduled in utils::get_scheduled_scenes(&conf, &parser, &all_scenes).iter() {
+                for scheduled in
+                    utils::get_scheduled_scenes(&conf, &parser, &all_scenes, &ignored_light_ids)
+                        .iter()
+                {
                     match active_scenes.get(&scheduled.lights_hash) {
                         None => {
                             // First encounter for this light group — record without applying
                             // to avoid triggering a slow transition on startup
-                            active_scenes
-                                .insert(scheduled.lights_hash, scheduled.scene_id.clone());
+                            active_scenes.insert(scheduled.lights_hash, scheduled.scene_id.clone());
                             continue;
                         }
                         Some(last_id) if last_id == &scheduled.scene_id => continue,
@@ -209,10 +223,7 @@ fn main() {
                         .map(|lights| {
                             lights.iter().any(|lid| {
                                 !ignored_light_ids.contains(&lid)
-                                    && light_states
-                                        .get(lid)
-                                        .map(|s| s.reachable)
-                                        .unwrap_or(false)
+                                    && light_states.get(lid).map(|s| s.reachable).unwrap_or(false)
                                     && all_lights
                                         .iter()
                                         .find(|l| &l.id == lid)
@@ -223,7 +234,9 @@ fn main() {
                         .unwrap_or(false);
 
                     if lights_on {
-                        println!("Time slot changed, transitioning to new scene with 5-min transition");
+                        println!(
+                            "Time slot changed, transitioning to new scene with 5-min transition"
+                        );
                         if let Err(err) = bridge.set_group_state(
                             &scheduled.scene_id,
                             &StateModifier::new()
@@ -234,6 +247,12 @@ fn main() {
                         ) {
                             eprintln!("Failed to auto-transition scene: {}", err);
                         }
+                        turn_off_orphaned_attached_lights(
+                            &bridge,
+                            &scheduled.scene_id,
+                            &all_scenes,
+                            &all_lights,
+                        );
                     }
 
                     active_scenes.insert(scheduled.lights_hash, scheduled.scene_id.clone());
@@ -279,6 +298,39 @@ fn main() {
                     }
                 }
             }
+        }
+    }
+}
+
+/// Turns off attached lights in the scene's room that the scene itself doesn't control
+fn turn_off_orphaned_attached_lights(
+    bridge: &Bridge,
+    scene_id: &String,
+    all_scenes: &Vec<Scene>,
+    all_lights: &Vec<Light>,
+) {
+    let Some(scene_lights) = all_scenes
+        .iter()
+        .find(|scene| &scene.id == scene_id)
+        .and_then(|scene| scene.lights.as_ref())
+    else {
+        return;
+    };
+
+    let Ok(all_groups) = bridge.get_all_groups() else {
+        eprintln!("Failed to retrieve groups");
+        return;
+    };
+
+    for light_id in utils::get_orphaned_attached_lights(scene_lights, &all_groups, all_lights) {
+        println!(
+            "Turning off attached light {} not part of the new scene",
+            light_id
+        );
+        if let Err(err) =
+            bridge.set_light_state(&light_id, &LightStateModifier::new().with_on(false))
+        {
+            eprintln!("Failed to turn off attached light: {}", err);
         }
     }
 }
